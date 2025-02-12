@@ -1,0 +1,1 @@
+{"clean": "/home/jason/speechbrain/templates/enhancement/audio_cache/training_set/clean/fileid_360.wav", "noise": "/home/jason/speechbrain/templates/enhancement/audio_cache/training_set/noise/fileid_360.wav", "noisy": "/home/jason/speechbrain/templates/enhancement/audio_cache/training_set/noisy/fileid_360.wav", "audio_length": 10.0, "snr": 13, "id": "train_0"}

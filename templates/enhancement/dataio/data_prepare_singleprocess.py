@@ -8,6 +8,8 @@ import re
 from random import sample
 import speechbrain as sb
 import json
+import csv
+from sklearn.utils import resample
 
 from dataio.utils import get_file, get_dir, skip, check_folders, collect_filenames
 from dataio.process_audio import mix_audio
@@ -130,22 +132,35 @@ def data_gen(**cfg):
     }
 
     train_list = []
+    required_fields = ['clean', 'noise', 'noisy', 'audio_length', 'snr']
+    
+    # 生成原始数据
     for filenum in range(file_settings['num_files']):
         try:
-            # Call mix_audio directly in a loop
             result = mix_audio(mix_audio_params, filenum)
+            
+            # 字段完整性检查
+            if not all(key in result for key in required_fields):
+                raise ValueError(f"Missing fields in {result}")
+                
+            # 数据类型验证
+            if not isinstance(result['audio_length'], (int, float)):
+                raise TypeError("audio_length must be numeric")
+            if not isinstance(result['snr'], (int, float)):
+                raise TypeError("SNR must be numeric")
+                
             train_list.append(result)
         except Exception as e:
-            print(f"Failed to generate file {filenum}: {str(e)}")
+            print(f"生成文件 {filenum} 失败: {str(e)}")
             continue
-    # Save to train list file
-    train_list_file = get_file(cfg, 'train_list_file')
-    with open(train_list_file, 'w') as lst:
-        for entry in train_list:
-            lst.write(f"{entry['clean']} {entry['noise']} {entry['noisy']} "
-                      f"{entry['audio_length']} {entry['snr']}\n")
     
-    print(f"Train list saved to: {train_list_file}")
+    # 保存为规范化中间文件（JSON 格式）
+    train_list_file = get_file(cfg, 'train_list_file')
+    
+    with open(train_list_file, 'w') as f:
+        json.dump(train_list, f, indent=2)
+    
+    print(f"中间文件已保存至: {train_list_file}")
     return train_list
 
 def data_prepare(**params):
@@ -156,103 +171,85 @@ def data_prepare(**params):
             not skip(params['train_list_file']):
         data_gen(**params)
 
-    df = pd.read_csv(
-        params['train_list_file'],
-        sep='\\s+', 
-        header=None, 
-        names= ['clean', 'noise', 'noisy', 'audio_length', 'snr']
-    )
-    df.columns = ['clean', 'noise', 'noisy', 'audio_length', 'snr']
-    total_data = df.shape[0]
-    df_index = [i for i in range(total_data)]
-
-    # Split the data into training and validation sets
+    with open(params['train_list_file']) as f:
+        train_list = json.load(f)
+    
+    # 转换为 DataFrame 以便采样（兼容旧逻辑）
+    df = pd.DataFrame(train_list)
+    total_data = len(df)
+    indices = list(range(total_data))
+    
+    # 数据分割（保持与原始逻辑兼容）
     valid_size = min(int(0.2 * total_data), 2000)
     test_size = min(int(0.1 * total_data), 100)
-
-    valid_ids = sample(df_index, valid_size)
-    test_ids = sample([i for i in df_index if i not in valid_ids], test_size)
-    train_ids = [i for i in df_index if i not in valid_ids and i not in test_ids]
     
-    paths = {
-    'train': params["train_annotation"],
-    'valid': params["valid_annotation"],
-    'test': params["test_annotation"]
+    valid_ids = resample(indices, n_samples=valid_size, replace=False, random_state=42)
+    remaining_ids = [i for i in indices if i not in valid_ids]
+    test_ids = resample(remaining_ids, n_samples=test_size, replace = False, random_state=42)
+    train_ids = [i for i in remaining_ids if i not in test_ids]
+    
+    # 生成最终数据集
+    datasets = {
+        'train': {'ids': train_ids, 'path': params['train_annotation']},
+        'valid': {'ids': valid_ids, 'path': params['valid_annotation']},
+        'test': {'ids': test_ids, 'path': params['test_annotation']}
     }
-
-    for ids, key in zip([train_ids, valid_ids, test_ids], ['train', 'valid', 'test']):
-        ids.sort()
-        df_subset = df.iloc[ids]
-        Path(os.path.dirname(paths[key])).mkdir(parents=True, exist_ok=True)
-        suffix = Path(paths[key]).suffix
-
-        if suffix == '.csv':
-            df_subset.to_csv(paths[key], index=False)
-            print(f'{key} set saved to {paths[key]}')
-        elif suffix == '.json' or suffix == '':
-            records = df_subset.to_dict(orient='records')
-            for idx, record in enumerate(records):
-                record['id'] = f"{key}_{idx}"
-            with open(paths[key], 'w') as f:
-                for record in records:
-                    f.write(json.dumps(record) + '\n')
-            print(f'{key} set saved to {paths[key]}')
-        else:
-            raise ValueError(f"Unsupported file extension: {suffix}")
+    
+    for key in ['train', 'valid', 'test']:
+        dataset_dict = {}
+        # 按索引提取数据并结构化
+        for idx, data_idx in enumerate(sorted(datasets[key]['ids'])):
+            raw_entry = df.iloc[data_idx].to_dict()
+            
+            entry = {
+                #"id": f"{key}_{idx}",
+                "clean": raw_entry['clean'],
+                "noise": raw_entry['noise'],
+                "noisy": raw_entry['noisy'],
+                "audio_length": float(raw_entry['audio_length']),
+                "snr": int(raw_entry['snr'])
+            }
+            dataset_dict[f"{key}_{idx}"] = entry
+        
+        # 保存 JSON
+        output_path = Path(datasets[key]['path'])
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        with open(output_path, 'w') as f:
+            json.dump(dataset_dict, f, indent=2)
+        
+        print(f"{key.capitalize()} 数据集 ({len(dataset_dict)} 条) 已保存至: {output_path}")
 
 def dataio_prep(**hparams):
-    """This function prepares the datasets to be used in the brain class.
-    It also defines the data processing pipeline through user-defined functions.
-
-    We expect `prepare_mini_librispeech` to have been called before this,
-    so that the `train.json` and `valid.json` manifest files are available.
-
-    Arguments
-    ---------
-    hparams : dict
-        This dictionary is loaded from the `train.yaml` file, and it includes
-        all the hyperparameters needed for dataset construction and loading.
-
-    Returns
-    -------
-    datasets : dict
-        Contains two keys, "train" and "valid" that correspond
-        to the appropriate DynamicItemDataset object.
-    """
-
-    # Define audio pipeline
-    @sb.utils.data_pipeline.takes("noisy_wav", "clean_wav")
-    @sb.utils.data_pipeline.provides("noisy_sig", "clean_sig", "spec", "clean_spec")
-    def audio_pipeline(noisy_wav, clean_wav):
-        """Load the signal, and pass it and its length to the corruption class.
-        This is done on the CPU in the `collate_fn`.
-        """
-        clean_sig = sb.dataio.dataio.read_audio(clean_wav)
+    # 定义音频处理管道（移除频谱生成）
+    @sb.utils.data_pipeline.takes("noisy", "clean")
+    @sb.utils.data_pipeline.provides("noisy_sig", "clean_sig")  # 移除 spec
+    def audio_pipeline(noisy, clean):
+        clean_sig = sb.dataio.dataio.read_audio(clean)
         yield clean_sig
-        noisy_sig = sb.dataio.dataio.read_audio(noisy_wav)
+        noisy_sig = sb.dataio.dataio.read_audio(noisy)
         yield noisy_sig
-        #clean_spec = hparams["compute_STFT"](clean_sig)
-        #yield clean_spec
-        #spec = hparams["compute_STFT"](noisy_sig)
-        #yield spec
     
-    # Define datasets sorted by ascending lengths for efficiency
+    # 数据集定义
     datasets = {}
     data_info = {
         "train": hparams["train_annotation"],
         "valid": hparams["valid_annotation"],
         "test": hparams["test_annotation"],
     }
+    
     hparams["dataloader_options"]["shuffle"] = False
+    
     for dataset in data_info:
         with open(data_info[dataset]) as f:
             data = json.load(f)
         
-        datasets[dataset] = sb.dataio.dataset.DynamicItemDataset.from_dict(
+        datasets[dataset] = sb.dataio.dataset.DynamicItemDataset(
             data=data,
             dynamic_items=[audio_pipeline],
-            output_keys=["id", "clean_sig", "noisy_sig"],
-        ).filtered_sorted(sort_key="length")
+            output_keys=["id", "clean_sig", "noisy_sig"]  # 移除 spec
+        ).filtered_sorted(sort_key="audio_length")
+        
     return datasets
 
 def rir_operations(rir_table_csv, rir_choice, lower_t60, upper_t60):

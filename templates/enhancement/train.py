@@ -27,16 +27,16 @@ class GTCRNBrain(sb.Brain):
         # We first move the batch to the appropriate device, and
         # compute the features necessary for masking.
         batch = batch.to(self.device)
-        noisy_spec = batch.spec
-        
+        noisy_wavs, lens = batch.noisy_sig  # (B, T)
+        clean_wavs, _ = batch.clean_sig
         '''
+        noisy_spec = batch.spec
         self.clean_wavs, self.lens = batch.clean_sig
         noisy_wavs, self.lens = self.hparams.wav_augment(
             self.clean_wavs, self.lens
         )
         '''
-        predict_spec = self.modules.model(noisy_spec)
-
+        enhanced_wavs = self.modules.model(noisy_wavs)
         '''
         # Also return predicted wav, for evaluation. Note that this could
         # also be used for a time-domain loss term.
@@ -47,8 +47,9 @@ class GTCRNBrain(sb.Brain):
 
         # Return a dictionary so we don't have to remember the order
         return {
-            "spec": predict_spec, 
-            #"wav": predict_wav
+            "wav": enhanced_wavs,
+            "clean_wavs": clean_wavs,
+            "lens": lens
         }
 
     def compute_objectives(self, predictions, batch, stage):
@@ -69,19 +70,19 @@ class GTCRNBrain(sb.Brain):
             A one-element tensor used for backpropagating the gradient.
         """
         # Prepare clean targets for comparison
-        clean_spec = batch.clean_spec # Shape: (B, F, T, 2)
+        clean_wavs, lens = batch.clean_sig
 
         # Directly compare the masked spectrograms with the clean targets
         loss = sb.nnet.losses.mse_loss(
-            predictions["spec"], clean_spec, self.lens
+            predictions["wav"], clean_wavs, lens
         )
 
         # Append this batch of losses to the loss metric for easy
         self.loss_metric.append(
             batch.id,
-            predictions["spec"],
-            clean_spec,
-            self.lens,
+            predictions["wav"],
+            clean_wavs,
+            lens,
             reduction="batch",
         )
 
@@ -93,8 +94,8 @@ class GTCRNBrain(sb.Brain):
             self.stoi_metric.append(
                 batch.id,
                 predictions["wav"],
-                self.clean_wavs,
-                self.lens,
+                clean_wavs,
+                lens,
                 reduction="batch",
             )
 
